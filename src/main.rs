@@ -56,14 +56,16 @@ fn get_env_or_default(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-fn build_output_filename(prefix: &str, hostname: &str, unix_ts: u64) -> String {
+fn build_output_filename(prefix: &str, hostname: &str, unix_ts: u64, compress: bool) -> String {
     let rank = get_env_or_default("RANK", "0");
     let local_rank = get_env_or_default("LOCAL_RANK", "0");
     let world_size = get_env_or_default("WORLD_SIZE", "1");
 
-    format!(
-        "{prefix}_{rank}_{local_rank}_{world_size}_{hostname}_{unix_ts}.jsonl.zst"
-    )
+    if compress {
+        format!("{prefix}_{rank}_{local_rank}_{world_size}_{hostname}_{unix_ts}.jsonl.zst")
+    } else {
+        format!("{prefix}_{rank}_{local_rank}_{world_size}_{hostname}_{unix_ts}.jsonl")
+    }
 }
 
 fn ensure_output_directory(path: &str) -> io::Result<()> {
@@ -120,12 +122,52 @@ fn spawn_reader_thread<R: io::Read + Send + 'static>(
     })
 }
 
-fn run(prefix: &str, command: &[String], sigkill_after: std::time::Duration) -> io::Result<ExitStatus> {
+enum OutputWriter {
+    Plain(io::BufWriter<std::fs::File>),
+    Zstd(zstd::Encoder<std::fs::File>),
+}
+
+impl OutputWriter {
+    fn write_record(&mut self, record: &LogRecord) -> io::Result<()> {
+        match self {
+            OutputWriter::Plain(writer) => {
+                serde_json::to_writer(writer, record)?;
+                writer.write_all(b"\n")?;
+            }
+            OutputWriter::Zstd(encoder) => {
+                serde_json::to_writer(encoder, record)?;
+                encoder.write_all(b"\n")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<()> {
+        match self {
+            OutputWriter::Plain(mut writer) => writer.flush(),
+            OutputWriter::Zstd(encoder) => {
+                let mut file = encoder.finish()?;
+                file.flush()
+            }
+        }
+    }
+}
+
+fn run(
+    prefix: &str,
+    command: &[String],
+    sigkill_after: std::time::Duration,
+    compress: bool,
+) -> io::Result<ExitStatus> {
     let hostname = get_env_or_default("HOSTNAME", "unknown");
-    let output_filename = build_output_filename(prefix, &hostname, unix_timestamp_secs());
+    let output_filename = build_output_filename(prefix, &hostname, unix_timestamp_secs(), compress);
     ensure_output_directory(&output_filename)?;
     let file = std::fs::File::create(&output_filename)?;
-    let mut encoder = zstd::Encoder::new(file, 10)?;
+    let mut output = if compress {
+        OutputWriter::Zstd(zstd::Encoder::new(file, 10)?)
+    } else {
+        OutputWriter::Plain(io::BufWriter::new(file))
+    };
     #[cfg(unix)]
     {
         let signal_result =
@@ -163,8 +205,7 @@ fn run(prefix: &str, command: &[String], sigkill_after: std::time::Duration) -> 
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(record) => {
-                serde_json::to_writer(&mut encoder, &record)?;
-                encoder.write_all(b"\n")?;
+                output.write_record(&record)?;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 #[cfg(unix)]
@@ -199,12 +240,11 @@ fn run(prefix: &str, command: &[String], sigkill_after: std::time::Duration) -> 
     let status = child.wait()?;
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
-    let mut file = encoder.finish()?;
-    file.flush()?;
+    output.finish()?;
     Ok(status)
 }
 
-fn parse_args() -> Result<(String, std::time::Duration, Vec<String>), String> {
+fn parse_args() -> Result<(String, std::time::Duration, Vec<String>, bool), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let separator_pos = args.iter().position(|arg| arg == "--");
     let Some(separator_pos) = separator_pos else {
@@ -215,6 +255,7 @@ fn parse_args() -> Result<(String, std::time::Duration, Vec<String>), String> {
     }
     let prefix = args[0].clone();
     let mut sigkill_after_secs = 20u64;
+    let mut compress = false;
     let mut idx = 1;
     while idx < separator_pos {
         match args[idx].as_str() {
@@ -227,6 +268,10 @@ fn parse_args() -> Result<(String, std::time::Duration, Vec<String>), String> {
                     .map_err(|_| "invalid value for --sigkill-after-secs".to_string())?;
                 idx += 2;
             }
+            "--zstd" => {
+                compress = true;
+                idx += 1;
+            }
             other => {
                 return Err(format!("unknown argument: {other}"));
             }
@@ -236,21 +281,26 @@ fn parse_args() -> Result<(String, std::time::Duration, Vec<String>), String> {
     if command.is_empty() {
         return Err("missing underlying program".to_string());
     }
-    Ok((prefix, std::time::Duration::from_secs(sigkill_after_secs), command))
+    Ok((
+        prefix,
+        std::time::Duration::from_secs(sigkill_after_secs),
+        command,
+        compress,
+    ))
 }
 
 fn main() {
-    let (prefix, sigkill_after, command) = match parse_args() {
+    let (prefix, sigkill_after, command, compress) = match parse_args() {
         Ok(values) => values,
         Err(message) => {
             eprintln!(
-                "Error: {message}\nUsage: log_tee FILE_PREFIX_TO_DUMP [--sigkill-after-secs SECS] -- underlying_program ..."
+                "Error: {message}\nUsage: log_tee FILE_PREFIX_TO_DUMP [--sigkill-after-secs SECS] [--zstd] -- underlying_program ..."
             );
             std::process::exit(2);
         }
     };
 
-    match run(&prefix, &command, sigkill_after) {
+    match run(&prefix, &command, sigkill_after, compress) {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(err) => {
             eprintln!("log_tee failed: {err}");
@@ -280,7 +330,9 @@ mod tests {
         env::remove_var("RANK");
         env::remove_var("LOCAL_RANK");
         env::remove_var("WORLD_SIZE");
-        let filename = build_output_filename("prefix", "host", 1234);
+        let filename = build_output_filename("prefix", "host", 1234, false);
+        assert_eq!(filename, "prefix_0_0_1_host_1234.jsonl");
+        let filename = build_output_filename("prefix", "host", 1234, true);
         assert_eq!(filename, "prefix_0_0_1_host_1234.jsonl.zst");
     }
 
@@ -289,8 +341,10 @@ mod tests {
         env::set_var("RANK", "2");
         env::set_var("LOCAL_RANK", "3");
         env::set_var("WORLD_SIZE", "4");
-        let filename = build_output_filename("prefix", "host", 42);
+        let filename = build_output_filename("prefix", "host", 42, true);
         assert_eq!(filename, "prefix_2_3_4_host_42.jsonl.zst");
+        let filename = build_output_filename("prefix", "host", 42, false);
+        assert_eq!(filename, "prefix_2_3_4_host_42.jsonl");
     }
 
     #[test]
