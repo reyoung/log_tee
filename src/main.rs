@@ -59,10 +59,10 @@ fn spawn_reader_thread<R: io::Read + Send + 'static>(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buf_reader = BufReader::new(reader);
-        let mut output = if stream_name == "stdout" {
-            io::stdout().lock()
+        let mut output: Box<dyn Write + Send> = if stream_name == "stdout" {
+            Box::new(io::stdout())
         } else {
-            io::stderr().lock()
+            Box::new(io::stderr())
         };
         let mut buffer = Vec::new();
         loop {
