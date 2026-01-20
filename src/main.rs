@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::env;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
@@ -52,6 +53,16 @@ fn build_output_filename(prefix: &str, hostname: &str, unix_ts: u64) -> String {
     )
 }
 
+fn ensure_output_directory(path: &str) -> io::Result<()> {
+    let parent = Path::new(path).parent();
+    if let Some(parent) = parent {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
 fn spawn_reader_thread<R: io::Read + Send + 'static>(
     reader: R,
     stream_name: &'static str,
@@ -99,6 +110,7 @@ fn spawn_reader_thread<R: io::Read + Send + 'static>(
 fn run(prefix: &str, command: &[String]) -> io::Result<ExitStatus> {
     let hostname = get_env_or_default("HOSTNAME", "unknown");
     let output_filename = build_output_filename(prefix, &hostname, unix_timestamp_secs());
+    ensure_output_directory(&output_filename)?;
     let file = std::fs::File::create(&output_filename)?;
     let mut encoder = zstd::Encoder::new(file, 10)?;
 
@@ -198,5 +210,20 @@ mod tests {
         env::set_var("WORLD_SIZE", "4");
         let filename = build_output_filename("prefix", "host", 42);
         assert_eq!(filename, "prefix_2_3_4_host_42.jsonl.zst");
+    }
+
+    #[test]
+    fn ensure_output_directory_creates_parent_dirs() {
+        let mut base = env::temp_dir();
+        base.push(format!("log_tee_test_{}", unix_timestamp_ms()));
+        let nested = base.join("subdir/log.jsonl.zst");
+        ensure_output_directory(
+            nested
+                .to_str()
+                .expect("temp path should be valid unicode"),
+        )
+        .expect("create dir");
+        assert!(base.join("subdir").is_dir());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
