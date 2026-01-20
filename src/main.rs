@@ -161,6 +161,7 @@ impl RotatingWriter {
         let mut payload = serde_json::to_vec(record)?;
         payload.push(b'\n');
         self.writer.write_all(&payload)?;
+        self.writer.flush()?;
         self.bytes_written += payload.len() as u64;
         if self.bytes_written >= MAX_OUTPUT_BYTES {
             self.rotate()?;
