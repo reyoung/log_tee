@@ -5,7 +5,20 @@ use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+#[cfg(unix)]
+static TERMINATE: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static CHILD_PID: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(unix)]
+extern "C" fn handle_sigterm(_: libc::c_int) {
+    TERMINATE.store(true, Ordering::SeqCst);
+}
 
 #[derive(Debug, Serialize)]
 struct LogRecord {
@@ -107,12 +120,23 @@ fn spawn_reader_thread<R: io::Read + Send + 'static>(
     })
 }
 
-fn run(prefix: &str, command: &[String]) -> io::Result<ExitStatus> {
+fn run(prefix: &str, command: &[String], sigkill_after: std::time::Duration) -> io::Result<ExitStatus> {
     let hostname = get_env_or_default("HOSTNAME", "unknown");
     let output_filename = build_output_filename(prefix, &hostname, unix_timestamp_secs());
     ensure_output_directory(&output_filename)?;
     let file = std::fs::File::create(&output_filename)?;
     let mut encoder = zstd::Encoder::new(file, 10)?;
+    #[cfg(unix)]
+    {
+        let signal_result =
+            unsafe { libc::signal(libc::SIGTERM, handle_sigterm as libc::sighandler_t) };
+        if signal_result == libc::SIG_ERR {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "failed to install SIGTERM handler",
+            ));
+        }
+    }
 
     let mut child = Command::new(&command[0])
         .args(&command[1..])
@@ -120,6 +144,8 @@ fn run(prefix: &str, command: &[String]) -> io::Result<ExitStatus> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    #[cfg(unix)]
+    CHILD_PID.store(child.id(), Ordering::SeqCst);
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -128,9 +154,46 @@ fn run(prefix: &str, command: &[String]) -> io::Result<ExitStatus> {
     let stdout_handle = spawn_reader_thread(stdout, "stdout", tx.clone());
     let stderr_handle = spawn_reader_thread(stderr, "stderr", tx);
 
-    for record in rx {
-        serde_json::to_writer(&mut encoder, &record)?;
-        encoder.write_all(b"\n")?;
+    #[cfg(unix)]
+    let mut sent_sigterm = false;
+    #[cfg(unix)]
+    let mut sent_sigkill = false;
+    #[cfg(unix)]
+    let mut sigterm_sent_at = None::<Instant>;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(record) => {
+                serde_json::to_writer(&mut encoder, &record)?;
+                encoder.write_all(b"\n")?;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(unix)]
+                {
+                    if TERMINATE.load(Ordering::SeqCst) {
+                        let pid = CHILD_PID.load(Ordering::SeqCst);
+                        if pid != 0 {
+                            if !sent_sigterm {
+                                unsafe {
+                                    libc::kill(pid as i32, libc::SIGTERM);
+                                }
+                                sent_sigterm = true;
+                                sigterm_sent_at = Some(Instant::now());
+                            } else if !sent_sigkill {
+                                if let Some(sent_at) = sigterm_sent_at {
+                                    if sent_at.elapsed() >= sigkill_after {
+                                        unsafe {
+                                            libc::kill(pid as i32, libc::SIGKILL);
+                                        }
+                                        sent_sigkill = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
 
     let status = child.wait()?;
@@ -141,8 +204,8 @@ fn run(prefix: &str, command: &[String]) -> io::Result<ExitStatus> {
     Ok(status)
 }
 
-fn parse_args() -> Result<(String, Vec<String>), String> {
-    let mut args = env::args().skip(1).collect::<Vec<_>>();
+fn parse_args() -> Result<(String, std::time::Duration, Vec<String>), String> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
     let separator_pos = args.iter().position(|arg| arg == "--");
     let Some(separator_pos) = separator_pos else {
         return Err("missing -- separator".to_string());
@@ -150,26 +213,44 @@ fn parse_args() -> Result<(String, Vec<String>), String> {
     if separator_pos == 0 {
         return Err("missing FILE_PREFIX_TO_DUMP".to_string());
     }
-    let prefix = args.remove(0);
-    args.remove(separator_pos - 1);
-    if args.is_empty() {
+    let prefix = args[0].clone();
+    let mut sigkill_after_secs = 20u64;
+    let mut idx = 1;
+    while idx < separator_pos {
+        match args[idx].as_str() {
+            "--sigkill-after-secs" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "missing value for --sigkill-after-secs".to_string())?;
+                sigkill_after_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid value for --sigkill-after-secs".to_string())?;
+                idx += 2;
+            }
+            other => {
+                return Err(format!("unknown argument: {other}"));
+            }
+        }
+    }
+    let command = args[separator_pos + 1..].to_vec();
+    if command.is_empty() {
         return Err("missing underlying program".to_string());
     }
-    Ok((prefix, args))
+    Ok((prefix, std::time::Duration::from_secs(sigkill_after_secs), command))
 }
 
 fn main() {
-    let (prefix, command) = match parse_args() {
+    let (prefix, sigkill_after, command) = match parse_args() {
         Ok(values) => values,
         Err(message) => {
             eprintln!(
-                "Error: {message}\nUsage: log_tee FILE_PREFIX_TO_DUMP -- underlying_program ..."
+                "Error: {message}\nUsage: log_tee FILE_PREFIX_TO_DUMP [--sigkill-after-secs SECS] -- underlying_program ..."
             );
             std::process::exit(2);
         }
     };
 
-    match run(&prefix, &command) {
+    match run(&prefix, &command, sigkill_after) {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(err) => {
             eprintln!("log_tee failed: {err}");
